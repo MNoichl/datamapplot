@@ -26,7 +26,8 @@ from colorspacious import cspace_convert
 from sklearn.cluster import KMeans
 from collections.abc import Iterable
 
-from pandas.api.types import is_string_dtype, is_numeric_dtype, is_datetime64_any_dtype
+from pandas.api.types import is_string_dtype, is_datetime64_any_dtype
+import datetime as dt
 
 from datamapplot.histograms import (
     generate_bins_from_numeric_data,
@@ -34,6 +35,7 @@ from datamapplot.histograms import (
     generate_bins_from_temporal_data,
 )
 from datamapplot.alpha_shapes import create_boundary_polygons, smooth_polygon
+from datamapplot.edge_bundling import bundle_edges
 from datamapplot.fonts import (
     can_reach_google_fonts,
     query_google_fonts,
@@ -565,7 +567,7 @@ def default_colormap_options(values_dict):
         colormap_metadata["field"] = candidate_field
         colormap_metadata["description"] = name
 
-        if values.dtype.kind in ["U", "S", "O"]:
+        if values.dtype.kind in ["U", "S", "O", "b"]:
             colormap_metadata["kind"] = "categorical"
             n_categories = len(np.unique(values))
             n = 0
@@ -583,7 +585,7 @@ def default_colormap_options(values_dict):
                     cmap = _DEFAULT_DICRETE_COLORMAPS[n]
             colormap_metadata["cmap"] = cmap
             used_colormaps.add(cmap)
-        elif pd.api.types.is_datetime64_any_dtype(values):
+        elif is_datetime64_any_dtype(values):
             colormap_metadata["kind"] = "datetime"
             colormap_metadata["cmap"] = _DEFAULT_CONTINUOUS_COLORMAPS[
                 continuous_cmap_counter
@@ -621,9 +623,12 @@ def array_to_colors(values, cmap_name, metadata, color_list=None):
     else:
         cmap = get_cmap(cmap_name)
 
+    vmin = metadata.pop("vmin", None)
+    vmax = metadata.pop("vmax", None)
+
     # Function to get finite/non-null mask
     def get_valid_mask(arr):
-        if pd.api.types.is_datetime64_any_dtype(arr):
+        if is_datetime64_any_dtype(arr):
             return ~pd.isna(arr)
         elif arr.dtype.kind in ["f", "i"]:
             return np.isfinite(arr)
@@ -631,7 +636,7 @@ def array_to_colors(values, cmap_name, metadata, color_list=None):
             return ~pd.isna(arr)
 
     # Handle datetime values
-    if pd.api.types.is_datetime64_any_dtype(values):
+    if is_datetime64_any_dtype(values):
         if cmap is None:
             raise ValueError("cmap must be provided for datetime data")
 
@@ -640,7 +645,11 @@ def array_to_colors(values, cmap_name, metadata, color_list=None):
             raise ValueError("No valid datetime values found")
 
         valid_values = values[valid_mask]
-        vmin, vmax = valid_values.min(), valid_values.max()
+
+        if not isinstance(vmin, (pd.Timestamp, np.datetime64, dt.datetime)):
+            vmin = valid_values.min()
+        if not isinstance(vmax, (pd.Timestamp, np.datetime64, dt.datetime)):
+            vmax = valid_values.max()
 
         # Convert to float for normalization
         normalized_values = np.zeros_like(values, dtype=float)
@@ -659,10 +668,11 @@ def array_to_colors(values, cmap_name, metadata, color_list=None):
         ]
         metadata["kind"] = "datetime"
 
-    elif values.dtype.kind in ["U", "S", "O"]:  # String or object type
+    elif values.dtype.kind in ["U", "S", "O", "b"]:
+        # String, object, or boolean type.
         valid_mask = get_valid_mask(values)
         if not np.any(valid_mask):
-            raise ValueError("No valid string values found")
+            raise ValueError("No valid string, object, or boolean values found")
 
         # Get unique valid values
         unique_values = np.unique(values[valid_mask])
@@ -732,7 +742,11 @@ def array_to_colors(values, cmap_name, metadata, color_list=None):
             raise ValueError("No valid numeric values found")
 
         valid_values = values[valid_mask]
-        vmin, vmax = valid_values.min(), valid_values.max()
+
+        if not np.issubdtype(type(vmin), np.number):
+            vmin = valid_values.min()
+        if not np.issubdtype(type(vmax), np.number):
+            vmax = valid_values.max()
 
         normalized_values = np.zeros_like(values, dtype=float)
         normalized_values[valid_mask] = (
@@ -845,6 +859,8 @@ def build_colormap_data(colormap_rawdata, colormap_metadata, base_colors):
             "colors": cmap_colors,
             "kind": metadata.get("kind", "continuous"),
             "nColors": metadata.get("n_colors", 5),
+            "vmin": metadata.get("vmin", None),
+            "vmax": metadata.get("vmax", None),
         }
         if "show_legend" in metadata:
             colormap["showLegend"] = metadata["show_legend"]
@@ -1065,6 +1081,21 @@ def label_text_and_polygon_dataframes(
         else:
             parents[0] = np.vstack((cluster_idx_vector,))
 
+    if len(label_locations) == 0:
+        # No labels, return empty dataframe
+        return pd.DataFrame(
+            {
+                "x": [],
+                "y": [],
+                "label": [],
+                "size": [],
+                "polygon": [],
+                "points": [],
+                "id": [],
+                "parent": [],
+            }
+        )
+
     label_locations = np.asarray(label_locations)
 
     data = {
@@ -1151,6 +1182,14 @@ def render_html(
     background_image=None,
     background_image_bounds=None,
     darkmode=False,
+    edge_bundle=False,
+    edge_bundle_keywords={
+        "n_neighbors": 10,
+        "sample_size": None,
+        "color_map_nn": 100,
+        "hammer_bundle_kwargs": {"use_dask": False},
+    },
+    edge_width=0.2,
     offline_data_prefix=None,
     offline_data_path=None,
     offline_data_chunk_size=500_000,
@@ -1187,6 +1226,7 @@ def render_html(
     offline_mode_font_data_file=None,
     splash_warning=None,
     noise_color="#999999",
+    noise_label="Unlabelled",
 ):
     """Given data about points, and data about labels, render to an HTML file
     using Deck.GL to provide an interactive plot that can be zoomed, panned
@@ -1345,6 +1385,15 @@ def render_html(
     darkmode: bool (optional, default=False)
         Whether to use darkmode.
 
+    edge_bundle: bool (optional, default=False)
+        Whether to include edges in the data map.
+
+    edge_bundle_keywords: dict (optional, default={...})
+        A dictionary of keywords to use for edge bundling, passed to the edge bundling algorithm.
+
+    edge_width: float (optional, default=0.2)
+        The width of the edges in the data map.
+
     offline_data_prefix: str or None (optional, default=None)
         If ``inline_data=False`` a number of data files will be created storing data for
         the plot and referenced by the HTML file produced. If not none then this will provide
@@ -1367,6 +1416,10 @@ def render_html(
         hover tooltip. This should be HTML with placeholders of the form ``{hover_text}``
         for the supplied hover text and ``{column_name}`` for columns from
         ``extra_point_data`` (see below).
+
+    dynamic_tooltip: dict[str, str] or None (optional, default=None)
+        A dictionary with keys: fetch_js, format_js, loading_js, error_js mapping to JavaScript 
+        functions that are passed to DynamicTooltipManager and define the behavior of the tooltip.
 
     extra_point_data: pandas.DataFrame or None (optional, default=None)
         A dataframe of extra information about points. This should be a dataframe with
@@ -1740,6 +1793,23 @@ def render_html(
         hover_data = pd.DataFrame(columns=("hover_text",))
         get_tooltip = "null"
 
+    # lines
+    if edge_bundle:
+        data_map_coords = point_dataframe[["x", "y"]].values
+        color_list = point_dataframe[["r", "g", "b"]].values
+        lines, colors = bundle_edges(
+            data_map_coords, color_list, rgb_colors=True, **edge_bundle_keywords
+        )
+        edge_data = pd.DataFrame({
+            'x1': lines[:, 0],
+            'y1': lines[:, 1],
+            'x2': lines[:, 2],
+            'y2': lines[:, 3],
+            'r': colors[:, 0].astype(np.uint8),
+            'g': colors[:, 1].astype(np.uint8),
+            'b': colors[:, 2].astype(np.uint8)
+        })
+
     # Histogram
     if enable_histogram:
         if isinstance(histogram_data.dtype, pd.CategoricalDtype):
@@ -1776,15 +1846,18 @@ def render_html(
             if len(colormap_metadata) > 0
             else 5
         )
-        quantizer = KMeans(n_clusters=n_swatches, random_state=0, n_init=1).fit(
-            cielab_colors
-        )
-        cluster_colors = [
-            rgb2hex(c)
-            for c in np.clip(
-                cspace_convert(quantizer.cluster_centers_, "CAM02-UCS", "sRGB1"), 0, 1
+        if len(cielab_colors) > 0:
+            quantizer = KMeans(n_clusters=n_swatches, random_state=0, n_init=1).fit(
+                cielab_colors
             )
-        ]
+            cluster_colors = [
+                rgb2hex(c)
+                for c in np.clip(
+                    cspace_convert(quantizer.cluster_centers_, "CAM02-UCS", "sRGB1"), 0, 1
+                )
+            ]
+        else:
+            cluster_colors = [noise_color] * n_swatches
         if cluster_layer_colormaps:
             if label_layers is None or cluster_colormap is None:
                 raise ValueError(
@@ -1870,6 +1943,16 @@ def render_html(
         else:
             base64_color_data = None
 
+        if edge_bundle:
+            buffer = io.BytesIO()
+            edge_data.to_feather(buffer, compression="uncompressed")
+            buffer.seek(0)
+            arrow_bytes = buffer.read()
+            gzipped_bytes = gzip.compress(arrow_bytes)
+            base64_edge_data = base64.b64encode(gzipped_bytes).decode()
+        else:
+            base64_edge_data = None
+
         file_prefix = None
         html_file_prefix = None
         n_chunks = 0
@@ -1880,6 +1963,7 @@ def render_html(
         base64_histogram_bin_data = ""
         base64_histogram_index_data = ""
         base64_color_data = ""
+        base64_edge_data = ""
 
         # Handle offline_data_path with backward compatibility
         if offline_data_path is not None:
@@ -1945,6 +2029,11 @@ def render_html(
             with gzip.open(f"{file_prefix}_histogram_index_data.zip", "wb") as f:
                 index_data.to_frame().to_feather(f, compression="uncompressed")
 
+        if edge_bundle:
+            edge_data_json = edge_data.to_json(path_or_buf=None, orient="records")
+            with gzip.open(f"{file_prefix}_edge_data.zip", "wb") as f:
+                f.write(bytes(edge_data_json, "utf-8"))
+
     title_font_color = "#000000" if not darkmode else "#ffffff"
     sub_title_font_color = "#777777"
     title_background = "#ffffffaa" if not darkmode else "#000000aa"
@@ -1965,7 +2054,7 @@ def render_html(
 
     if dynamic_tooltip is not None:
         enable_dynamic_tooltip = True
-        tooltip_identifier_js = dynamic_tooltip["identifier_js"]
+        tooltip_identifier_js = dynamic_tooltip.get("identifier_js", None)
         tooltip_fetch_js = dynamic_tooltip["fetch_js"]
         tooltip_format_js = dynamic_tooltip["format_js"]
         tooltip_loading_js = dynamic_tooltip["loading_js"]
@@ -2142,6 +2231,9 @@ def render_html(
         base64_histogram_bin_data=base64_histogram_bin_data,
         base64_histogram_index_data=base64_histogram_index_data,
         base64_color_data=base64_color_data,
+        edge_bundle=edge_bundle,
+        base64_edge_data=base64_edge_data,
+        edge_width=edge_width,
         file_prefix=html_file_prefix,
         point_size=point_size,
         point_outline_color=point_outline_color,
@@ -2152,6 +2244,7 @@ def render_html(
         point_radius_max_pixels=point_radius_max_pixels,
         point_radius_min_pixels=point_radius_min_pixels,
         label_text_color=label_text_color,
+        noise_label=noise_label,
         line_spacing=line_spacing,
         text_min_pixel_size=text_min_pixel_size,
         text_max_pixel_size=text_max_pixel_size,
